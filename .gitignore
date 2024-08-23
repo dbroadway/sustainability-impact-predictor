@@ -1,0 +1,48 @@
+# Python-related
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Operating system-related
+.DS_Store
+Thumbs.db
+
+# Large data files
+epa_data/data/2022_data_summary_spreadsheets/*.xlsx
+epa_data/data/2022_data_summary_spreadsheets_0.zip
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# Logs and databases
+*.log
+*.sqlite
+
+# Output files
+*.csv
+*.json
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# Model files (if you want to exclude them)
+*.joblib
+*.pkl
+
+# Keep specific data files if needed
+# !epa_data/data/2022_data_summary_spreadsheets/specific_file_to_keep.xlsx
