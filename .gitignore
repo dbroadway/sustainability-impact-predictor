@@ -46,3 +46,8 @@ epa_data/data/2022_data_summary_spreadsheets_0.zip
 
 # Keep specific data files if needed
 # !epa_data/data/2022_data_summary_spreadsheets/specific_file_to_keep.xlsx
+# Exclude Excel files
+*.xlsx
+
+# Exclude CSV files
+*.csv
