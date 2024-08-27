@@ -1,20 +1,30 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import GridSearchCV
 import joblib
 import os
 import matplotlib.pyplot as plt
 import logging
+import traceback
+from scipy import stats
+import sys
+from scipy.sparse import issparse
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Error handling
+def exception_handler(exception_type, exception, traceback):
+    print(f"{exception_type.__name__}: {exception}")
+
+sys.excepthook = exception_handler
 
 def load_data(data_path):
     try:
@@ -25,8 +35,39 @@ def load_data(data_path):
         logging.error(f"Error loading data from {data_path}: {str(e)}")
         raise
 
+def engineer_features(X):
+    print("Engineering features...")
+    # List of potential features we want to use
+    potential_features = [
+        'Total reported direct emissions',
+        'Electricity Generation',
+        'Nitrous Oxide (N2O) emissions',
+        'Methane (CH4) emissions',
+        'HFC emissions'
+    ]
+
+    # Check which features are actually present in the dataset
+    available_features = [feat for feat in potential_features if feat in X.columns]
+
+    logging.info(f"Available features for engineering: {available_features}")
+
+    # Create interaction terms for available features
+    for i in range(len(available_features)):
+        for j in range(i+1, len(available_features)):
+            feat1 = available_features[i]
+            feat2 = available_features[j]
+            interaction_name = f"{feat1}_X_{feat2}"
+            X[interaction_name] = X[feat1] * X[feat2]
+            logging.info(f"Created interaction term: {interaction_name}")
+
+    logging.info("Feature engineering completed")
+    return X
+
 def preprocess_data(df, target_column):
+    print("Preprocessing data...")
     logging.info("Starting data preprocessing")
+    logging.info(f"Columns in the dataset: {df.columns.tolist()}")
+    
     X = df.drop([target_column], axis=1)
     y = df[target_column]
 
@@ -38,10 +79,18 @@ def preprocess_data(df, target_column):
     X = X[y.notna()]
     y = y.dropna()
     
-    logging.info(f"Total rows after removing NaN: {len(y)}")
+    # Log transform the target variable
+    y = np.log1p(y)
+    logging.info("Applied log transformation to target variable")
+    
+    # Engineer features
+    X = engineer_features(X)
+    
+    logging.info(f"Total rows after preprocessing: {len(y)}")
     return X, y
 
 def create_preprocessor(X_train, preprocessor_path):
+    print("Creating preprocessor...")
     if os.path.exists(preprocessor_path):
         logging.info("Loading existing preprocessor...")
         return joblib.load(preprocessor_path)
@@ -72,7 +121,63 @@ def create_preprocessor(X_train, preprocessor_path):
     logging.info(f"Preprocessor saved to {preprocessor_path}")
     return preprocessor
 
-def create_and_evaluate_model(model, X_train, X_test, y_train, y_test, model_name):
+def create_range_based_models(X, y, preprocessor, model_class, param_grid):
+    print("Creating range-based models...")
+    # Define emission ranges
+    low_threshold = y.quantile(0.33)
+    high_threshold = y.quantile(0.67)
+    
+    # Preprocess the data
+    X_preprocessed = preprocessor.transform(X)
+    
+    # Split data into ranges
+    X_low, y_low = X_preprocessed[y <= low_threshold], y[y <= low_threshold]
+    X_medium, y_medium = X_preprocessed[(y > low_threshold) & (y <= high_threshold)], y[(y > low_threshold) & (y <= high_threshold)]
+    X_high, y_high = X_preprocessed[y > high_threshold], y[y > high_threshold]
+    
+    # Create and train models for each range
+    models = {}
+    for name, X_range, y_range in [("low", X_low, y_low), ("medium", X_medium, y_medium), ("high", X_high, y_high)]:
+        model = GridSearchCV(model_class(), param_grid, cv=3, n_jobs=-1)
+        model.fit(X_range, y_range)
+        models[name] = model
+        logging.info(f"Trained {name} emissions model. Best params: {model.best_params_}")
+    
+    return models, low_threshold, high_threshold
+
+def predict_with_range_models(models, X, preprocessor, low_threshold, high_threshold):
+    X_preprocessed = preprocessor.transform(X)
+    predictions = np.zeros(X.shape[0])
+    
+    for i in range(X.shape[0]):
+        if issparse(X_preprocessed):
+            x = X_preprocessed[i].toarray().flatten()
+        else:
+            x = X_preprocessed[i]
+        
+        if X.iloc[i]['Total reported direct emissions'] <= low_threshold:
+            predictions[i] = models['low'].predict(x.reshape(1, -1))[0]
+        elif X.iloc[i]['Total reported direct emissions'] <= high_threshold:
+            predictions[i] = models['medium'].predict(x.reshape(1, -1))[0]
+        else:
+            predictions[i] = models['high'].predict(x.reshape(1, -1))[0]
+    
+    return predictions
+
+def prediction_intervals_rf(rf_model, X, percentile=95):
+    predictions = []
+    for estimator in rf_model.estimators_:
+        predictions.append(estimator.predict(X))
+    predictions = np.array(predictions)
+    
+    lower_bound = np.percentile(predictions, (100 - percentile) / 2., axis=0)
+    upper_bound = np.percentile(predictions, 100 - (100 - percentile) / 2., axis=0)
+    point_estimate = np.mean(predictions, axis=0)
+    
+    return point_estimate, lower_bound, upper_bound
+
+def create_and_evaluate_model(model, X_train, X_test, y_train, y_test, model_name, feature_names):
+    print(f"Creating and evaluating {model_name}...")
     logging.info(f"Training and evaluating {model_name}")
     model.fit(X_train, y_train)
     
@@ -85,50 +190,60 @@ def create_and_evaluate_model(model, X_train, X_test, y_train, y_test, model_nam
     y_pred_train = model.predict(X_train)
     y_pred_test = model.predict(X_test)
     
+    # Inverse transform predictions and actual values
+    y_pred_train = np.expm1(y_pred_train)
+    y_pred_test = np.expm1(y_pred_test)
+    y_train_original = np.expm1(y_train)
+    y_test_original = np.expm1(y_test)
+    
     logging.info(f"\n{model_name} Performance:")
-    logging.info(f"Train R2: {r2_score(y_train, y_pred_train):.4f}")
-    logging.info(f"Test R2: {r2_score(y_test, y_pred_test):.4f}")
-    logging.info(f"Train MAE: {mean_absolute_error(y_train, y_pred_train):.2f}")
-    logging.info(f"Test MAE: {mean_absolute_error(y_test, y_pred_test):.2f}")
+    logging.info(f"Train R2: {r2_score(y_train_original, y_pred_train):.4f}")
+    logging.info(f"Test R2: {r2_score(y_test_original, y_pred_test):.4f}")
+    logging.info(f"Train MAE: {mean_absolute_error(y_train_original, y_pred_train):.2f}")
+    logging.info(f"Test MAE: {mean_absolute_error(y_test_original, y_pred_test):.2f}")
     
     # Feature importance
-    if hasattr(model, 'feature_importances_'):
-        logging.info(f"Extracting feature importances for {model_name}")
-        importances = model.feature_importances_
-        indices = np.argsort(importances)[::-1]
-        
-        if hasattr(X_train, 'columns'):
-            feature_names = X_train.columns
+    try:
+        if hasattr(model.best_estimator_, 'feature_importances_'):
+            logging.info(f"Extracting feature importances for {model_name}")
+            importances = model.best_estimator_.feature_importances_
+            indices = np.argsort(importances)[::-1]
+            
+            logging.info(f"Shape of importances: {importances.shape}")
+            
+            # Create a DataFrame with feature importances
+            importance_df = pd.DataFrame({
+                'feature': [feature_names[i] for i in indices],
+                'importance': importances[indices]
+            })
+            
+            # Save to CSV
+            csv_path = f"../models/{model_name.replace(' ', '_').lower()}_feature_importance.csv"
+            importance_df.to_csv(csv_path, index=False)
+            logging.info(f"Feature importances saved to {csv_path}")
+            
+            # Plot feature importances
+            plt.figure(figsize=(12, 8))
+            plt.title(f"Top 20 Feature Importances - {model_name}")
+            plt.bar(range(20), importances[indices][:20])
+            plt.xticks(range(20), [feature_names[i] for i in indices[:20]], rotation=90)
+            plt.tight_layout()
+            
+            # Save the plot
+            plot_path = f"../models/{model_name.replace(' ', '_').lower()}_feature_importance.png"
+            plt.savefig(plot_path)
+            plt.close()
+            logging.info(f"Feature importance plot saved to {plot_path}")
         else:
-            feature_names = [f"feature_{i}" for i in range(X_train.shape[1])]
-        
-        # Create a DataFrame with feature importances
-        importance_df = pd.DataFrame({
-            'feature': [feature_names[i] for i in indices],
-            'importance': importances[indices]
-        })
-        
-        # Save to CSV
-        csv_path = f"../models/{model_name.replace(' ', '_').lower()}_feature_importance.csv"
-        importance_df.to_csv(csv_path, index=False)
-        logging.info(f"Feature importances saved to {csv_path}")
-        
-        # Plot feature importances
-        plt.figure(figsize=(12, 8))
-        plt.title(f"Top 20 Feature Importances - {model_name}")
-        plt.bar(range(20), importances[indices][:20])
-        plt.xticks(range(20), [feature_names[i] for i in indices[:20]], rotation=90)
-        plt.tight_layout()
-        
-        # Save the plot
-        plot_path = f"../models/{model_name.replace(' ', '_').lower()}_feature_importance.png"
-        plt.savefig(plot_path)
-        plt.close()
-        logging.info(f"Feature importance plot saved to {plot_path}")
+            logging.warning(f"{model_name} best estimator does not have feature_importances_ attribute")
+    except Exception as e:
+        logging.error(f"Error in feature importance extraction for {model_name}: {str(e)}")
+        logging.error(traceback.format_exc())
     
     return model
 
 def main():
+    print("Starting main function...")
     # Load the feature-engineered data
     data_path = os.path.join('..', 'data', 'feature_engineered_data.csv')
     df = load_data(data_path)
@@ -147,6 +262,10 @@ def main():
     X_train_preprocessed = preprocessor.transform(X_train)
     X_test_preprocessed = preprocessor.transform(X_test)
 
+    # Get feature names after preprocessing
+    feature_names = (preprocessor.named_transformers_['num'].get_feature_names_out().tolist() + 
+                     preprocessor.named_transformers_['cat'].get_feature_names_out().tolist())
+    
     # Hyperparameter tuning
     rf_params = {
         'n_estimators': [100, 200],
@@ -160,40 +279,151 @@ def main():
         'learning_rate': [0.01, 0.1, 0.2]
     }
 
+    # Create range-based models
+    rf_models, rf_low_threshold, rf_high_threshold = create_range_based_models(X_train, y_train, preprocessor, RandomForestRegressor, rf_params)
+    gb_models, gb_low_threshold, gb_high_threshold = create_range_based_models(X_train, y_train, preprocessor, GradientBoostingRegressor, gb_params)
+
+    # Evaluate range-based models
+    rf_predictions = predict_with_range_models(rf_models, X_test, preprocessor, rf_low_threshold, rf_high_threshold)
+    gb_predictions = predict_with_range_models(gb_models, X_test, preprocessor, gb_low_threshold, gb_high_threshold)
+
+    # Inverse transform predictions and actual values
+    y_test_original = np.expm1(y_test)
+    rf_predictions = np.expm1(rf_predictions)
+    gb_predictions = np.expm1(gb_predictions)
+
+    logging.info("\nRange-based Random Forest Performance:")
+    logging.info(f"Test R2: {r2_score(y_test_original, rf_predictions):.4f}")
+    logging.info(f"Test MAE: {mean_absolute_error(y_test_original, rf_predictions):.2f}")
+
+    logging.info("\nRange-based Gradient Boosting Performance:")
+    logging.info(f"Test R2: {r2_score(y_test_original, gb_predictions):.4f}")
+    logging.info(f"Test MAE: {mean_absolute_error(y_test_original, gb_predictions):.2f}")
+
+    # Train and evaluate single models (for comparison)
     rf_model = GridSearchCV(RandomForestRegressor(random_state=42), rf_params, cv=3, n_jobs=-1)
     gb_model = GridSearchCV(GradientBoostingRegressor(random_state=42), gb_params, cv=3, n_jobs=-1)
 
-    # Train and evaluate models
-    rf_model = create_and_evaluate_model(rf_model, X_train_preprocessed, X_test_preprocessed, y_train, y_test, "Random Forest")
-    gb_model = create_and_evaluate_model(gb_model, X_train_preprocessed, X_test_preprocessed, y_train, y_test, "Gradient Boosting")
+    rf_model = create_and_evaluate_model(rf_model, X_train_preprocessed, X_test_preprocessed, y_train, y_test, "Random Forest", feature_names)
+    gb_model = create_and_evaluate_model(gb_model, X_train_preprocessed, X_test_preprocessed, y_train, y_test, "Gradient Boosting", feature_names)
 
     # Print best parameters
     logging.info(f"\nBest Random Forest Parameters: {rf_model.best_params_}")
     logging.info(f"Best Gradient Boosting Parameters: {gb_model.best_params_}")
 
+    # Prediction intervals for Random Forest
+    point_estimate, lower_bound, upper_bound = prediction_intervals_rf(rf_model.best_estimator_, X_test_preprocessed)
+    logging.info(f"Average prediction interval width: {np.mean(np.expm1(upper_bound) - np.expm1(lower_bound)):.2f}")
+
     # Save the best model (based on test set performance)
-    best_model = rf_model if r2_score(y_test, rf_model.predict(X_test_preprocessed)) > r2_score(y_test, gb_model.predict(X_test_preprocessed)) else gb_model
+    rf_score = r2_score(y_test_original, np.expm1(rf_model.predict(X_test_preprocessed)))
+    gb_score = r2_score(y_test_original, np.expm1(gb_model.predict(X_test_preprocessed)))
+    
+    best_model = rf_model if rf_score > gb_score else gb_model
+    best_model_name = "Random Forest" if rf_score > gb_score else "Gradient Boosting"
+    
     model_path = os.path.join('..', 'models', 'best_model.joblib')
     joblib.dump(best_model, model_path)
-    logging.info(f"\nBest model saved to {model_path}")
+    logging.info(f"\nBest model ({best_model_name}) saved to {model_path}")
 
-    # Error analysis
-    best_predictions = best_model.predict(X_test_preprocessed)
-    residuals = y_test - best_predictions
+    # Print final performance of the best model
+    best_predictions = np.expm1(best_model.predict(X_test_preprocessed))
+    logging.info(f"\nBest Model ({best_model_name}) Final Performance:")
+    logging.info(f"Test R2: {r2_score(y_test_original, best_predictions):.4f}")
+    logging.info(f"Test MAE: {mean_absolute_error(y_test_original, best_predictions):.2f}")
 
+    # Create residual plot
     plt.figure(figsize=(10, 6))
-    plt.scatter(best_predictions, residuals)
+    plt.scatter(best_predictions, y_test_original - best_predictions)
     plt.xlabel("Predicted CO2 Emissions")
     plt.ylabel("Residuals")
-    plt.title("Residual Plot")
+    plt.title(f"Residual Plot - Best Model ({best_model_name})")
     residual_plot_path = "../models/residual_plot.png"
     plt.savefig(residual_plot_path)
     plt.close()
     logging.info(f"Residual plot saved to {residual_plot_path}")
 
+    # Error Analysis
     logging.info("\nError Analysis:")
-    logging.info(f"Mean Absolute Error: {mean_absolute_error(y_test, best_predictions):.2f}")
-    logging.info(f"Root Mean Squared Error: {np.sqrt(mean_squared_error(y_test, best_predictions)):.2f}")
+    
+# Calculate and log various error metrics
+    mse = mean_squared_error(y_test_original, best_predictions)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_test_original, best_predictions)
+    
+    mape = np.mean(np.abs((y_test_original - best_predictions) / y_test_original) * 100)
+    if np.isinf(mape):
+        mape = np.mean(np.abs((y_test_original - best_predictions) / (y_test_original + 1e-8)) * 100)
+    
+    logging.info(f"Mean Squared Error: {mse:.2f}")
+    logging.info(f"Root Mean Squared Error: {rmse:.2f}")
+    logging.info(f"Mean Absolute Error: {mae:.2f}")
+    logging.info(f"Mean Absolute Percentage Error: {mape:.2f}%")
+
+    # Residual Analysis
+    residuals = y_test_original - best_predictions
+    
+    # Residual statistics
+    logging.info(f"\nResidual Statistics:")
+    logging.info(f"Mean of Residuals: {np.mean(residuals):.2f}")
+    logging.info(f"Standard Deviation of Residuals: {np.std(residuals):.2f}")
+
+    # Error Distribution
+    plt.figure(figsize=(10, 6))
+    plt.hist(residuals, bins=50)
+    plt.xlabel("Residual Value")
+    plt.ylabel("Frequency")
+    plt.title("Distribution of Residuals")
+    error_dist_path = "../models/error_distribution.png"
+    plt.savefig(error_dist_path)
+    plt.close()
+    logging.info(f"Error distribution plot saved to {error_dist_path}")
+
+    # Actual vs Predicted Plot
+    plt.figure(figsize=(10, 6))
+    plt.scatter(y_test_original, best_predictions)
+    plt.plot([y_test_original.min(), y_test_original.max()], [y_test_original.min(), y_test_original.max()], 'r--', lw=2)
+    plt.xlabel("Actual CO2 Emissions")
+    plt.ylabel("Predicted CO2 Emissions")
+    plt.title(f"Actual vs Predicted - Best Model ({best_model_name})")
+    actual_vs_predicted_path = "../models/actual_vs_predicted.png"
+    plt.savefig(actual_vs_predicted_path)
+    plt.close()
+    logging.info(f"Actual vs Predicted plot saved to {actual_vs_predicted_path}")
+
+# Analyze largest errors
+    abs_errors = np.abs(residuals)
+    largest_errors = pd.Series(abs_errors).nlargest(10)
+    logging.info("\nLargest Errors:")
+    for i, error in largest_errors.items():
+        actual = y_test_original.iloc[i] if i < len(y_test_original) else "N/A"
+        predicted = best_predictions[i] if i < len(best_predictions) else "N/A"
+        if isinstance(actual, (int, float)) and isinstance(predicted, (int, float)):
+            logging.info(f"Index: {i}, Actual: {actual:.2f}, Predicted: {predicted:.2f}, Error: {error:.2f}")
+        else:
+            logging.info(f"Index: {i}, Actual: {actual}, Predicted: {predicted}, Error: {error:.2f}")
+
+    # Performance across different ranges
+    y_test_original_series = pd.Series(y_test_original)
+    ranges = [y_test_original_series.min(), y_test_original_series.quantile(0.25), 
+              y_test_original_series.quantile(0.5), y_test_original_series.quantile(0.75), 
+              y_test_original_series.max()]
+    logging.info("\nPerformance across different ranges:")
+    for i in range(len(ranges) - 1):
+        mask = (y_test_original_series >= ranges[i]) & (y_test_original_series < ranges[i+1])
+        range_predictions = best_predictions[mask]
+        range_actuals = y_test_original_series[mask]
+        range_mse = mean_squared_error(range_actuals, range_predictions)
+        range_r2 = r2_score(range_actuals, range_predictions)
+        logging.info(f"Range {ranges[i]:.2f} to {ranges[i+1]:.2f}:")
+        logging.info(f"  MSE: {range_mse:.2f}")
+        logging.info(f"  R2: {range_r2:.4f}")
+
+    logging.info("Model training and evaluation completed successfully.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logging.error(f"An error occurred: {str(e)}")
+        logging.error(traceback.format_exc())
