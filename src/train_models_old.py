@@ -1,7 +1,10 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import scipy
+from scipy import sparse
+from sklearn.base import BaseEstimator, RegressorMixin, clone
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV, learning_curve
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, VotingRegressor, IsolationForest
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.impute import SimpleImputer
@@ -12,11 +15,8 @@ import os
 import matplotlib.pyplot as plt
 import logging
 import traceback
-from scipy import stats
 import sys
-from scipy.sparse import issparse
 from sklearn.base import BaseEstimator, RegressorMixin, clone
-import scipy.sparse
 
 
 # Set up logging
@@ -27,6 +27,35 @@ def exception_handler(exception_type, exception, traceback):
     print(f"{exception_type.__name__}: {exception}")
 
 sys.excepthook = exception_handler
+
+def plot_feature_importance(model, feature_names, top_n=20):
+    importances = model.feature_importances_
+    indices = np.argsort(importances)[::-1]
+
+    # Ensure we don't try to plot more features than we have
+    top_n = min(top_n, len(feature_names))
+
+    plt.figure(figsize=(12, 8))
+    plt.title(f"Top {top_n} Feature Importances")
+    plt.bar(range(top_n), importances[indices][:top_n])
+    plt.xticks(range(top_n), [feature_names[i] for i in indices[:top_n]], rotation=90)
+    plt.tight_layout()
+    plt.savefig("../models/feature_importance.png")
+    plt.close()
+
+def plot_learning_curve(estimator, X, y, cv=5):
+    train_sizes, train_scores, test_scores = learning_curve(
+        estimator, X, y, cv=cv, n_jobs=-1, train_sizes=np.linspace(0.1, 1.0, 10))
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_sizes, np.mean(train_scores, axis=1), 'o-', label="Training score")
+    plt.plot(train_sizes, np.mean(test_scores, axis=1), 'o-', label="Cross-validation score")
+    plt.xlabel("Training examples")
+    plt.ylabel("Score")
+    plt.legend(loc="best")
+    plt.title("Learning Curve")
+    plt.savefig("../models/learning_curve.png")
+    plt.close()
 
 # Range-Based Regressor
 class RangeBasedRegressor(BaseEstimator, RegressorMixin):
@@ -55,16 +84,21 @@ class RangeBasedRegressor(BaseEstimator, RegressorMixin):
     def predict(self, X):
         predictions = np.zeros(X.shape[0])
 
-        # Use the first feature (assuming it's 'Total reported direct emissions') to determine which model to use
-        if scipy.sparse.issparse(X):
+        # Use the first feature to determine which model to use
+        if sparse.issparse(X):
             emissions = X.tocsr()[:, 0].toarray().flatten()
+        elif isinstance(X, pd.DataFrame):
+            emissions = X.iloc[:, 0].values
         else:
             emissions = X[:, 0]
 
         for i, (lower, upper) in enumerate(self.ranges):
             mask = (emissions >= lower) & (emissions < upper)
             if np.any(mask):
-                predictions[mask] = self.models[i].predict(X[mask])
+                if isinstance(X, pd.DataFrame):
+                    predictions[mask] = self.models[i].predict(X.iloc[mask])
+                else:
+                    predictions[mask] = self.models[i].predict(X[mask])
 
         return predictions
 
@@ -73,6 +107,19 @@ def weighted_mape(y_true, y_pred, weights=None):
     if weights is None:
         weights = y_true / y_true.sum()
     return np.average(np.abs((y_true - y_pred) / np.maximum(y_true, 1e-8)), weights=weights) * 100
+
+def select_features(df):
+    exclude_keywords = ['emissions', 'CO2', 'reported direct', 'GHG', 'Facility Id', 'FRS Id', 'Zip Code']
+    keep_features = [
+        'State', 'Latitude', 'Longitude', 'Primary NAICS Code',
+        'Industry Type (sectors)', 'Industry Type (subparts)',
+        'Does the facility employ continuous emissions monitoring?'
+    ]
+    
+    selected_features = [col for col in df.columns if any(keyword.lower() in col.lower() for keyword in keep_features) 
+                         and not any(keyword.lower() in col.lower() for keyword in exclude_keywords)]
+    
+    return selected_features, df[selected_features]
 
 # Gradient Boosting with Prediction Intervals
 class GradientBoostingWithPI(GradientBoostingRegressor):
@@ -119,103 +166,73 @@ def load_data(data_path):
 
 def engineer_features(X, feature_names):
     print("Engineering features...")
-    # Convert sparse matrix to DataFrame if necessary
-    if scipy.sparse.issparse(X):
-        X = pd.DataFrame.sparse.from_spmatrix(X, columns=feature_names)
-    elif isinstance(X, np.ndarray):
-        X = pd.DataFrame(X, columns=feature_names)
-    
-    # List of potential features we want to use
-    potential_features = [
-        'Total reported direct emissions',
-        'Electricity Generation',
-        'Nitrous Oxide (N2O) emissions',
-        'Methane (CH4) emissions',
-        'HFC emissions'
-    ]
 
-    # Check which features are actually present in the dataset
-    available_features = [feat for feat in potential_features if feat in X.columns]
+    # Create interaction terms
+    if 'Industry Type (sectors)' in X.columns and 'Latitude' in X.columns:
+        X['Industry_Latitude'] = X['Industry Type (sectors)'].astype('category').cat.codes * X['Latitude']
+    if 'Industry Type (sectors)' in X.columns and 'Longitude' in X.columns:
+        X['Industry_Longitude'] = X['Industry Type (sectors)'].astype('category').cat.codes * X['Longitude']
 
-    logging.info(f"Available features for engineering: {available_features}")
+    # Bin latitude and longitude
+    if 'Latitude' in X.columns:
+        X['Latitude_Bin'] = pd.cut(X['Latitude'], bins=10, labels=False)
+    if 'Longitude' in X.columns:
+        X['Longitude_Bin'] = pd.cut(X['Longitude'], bins=10, labels=False)
 
-    # Create interaction terms for available features
-    for i in range(len(available_features)):
-        for j in range(i+1, len(available_features)):
-            feat1 = available_features[i]
-            feat2 = available_features[j]
-            if feat1 in X.columns and feat2 in X.columns:
-                interaction_name = f"{feat1}_X_{feat2}"
-                X[interaction_name] = X[feat1] * X[feat2]
-                logging.info(f"Created interaction term: {interaction_name}")
+    # Handle any remaining NaN values
+    X = X.fillna(X.mean())
 
-    logging.info("Feature engineering completed")
+    logging.info(f"Engineered features: {X.columns.tolist()}")
     return X
 
-def preprocess_data(data, target_column=None):
+def preprocess_data(X, y):
     print("Preprocessing data...")
     logging.info("Starting data preprocessing")
 
-    if isinstance(data, pd.DataFrame):
-        # If data is a DataFrame, we assume it's raw data that needs preprocessing
-        logging.info(f"Columns in the dataset: {data.columns.tolist()}")
+    # Handle NaN values in the target variable
+    nan_mask = y.notna()
+    X = X[nan_mask]
+    y = y[nan_mask]
 
-        if target_column is None:
-            raise ValueError("target_column must be specified when input is a DataFrame")
+    # Identify numeric and categorical columns
+    numeric_features = X.select_dtypes(include=['int64', 'float64']).columns
+    categorical_features = X.select_dtypes(include=['object']).columns
 
-        X = data.drop([target_column], axis=1)
-        y = data[target_column]
+    # Create preprocessing steps for numeric and categorical data
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
 
-        # Handle NaN values in the target variable
-        nan_count = y.isna().sum()
-        logging.info(f"Rows with NaN in target variable: {nan_count}")
-        logging.info(f"Total rows before removing NaN: {len(y)}")
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+    ])
 
-        X = X[y.notna()]
-        y = y.dropna()
-
-        # Log transform the target variable
-        y = np.log1p(y)
-        logging.info("Applied log transformation to target variable")
-
-        # Identify numeric and categorical columns
-        numeric_features = X.select_dtypes(include=['int64', 'float64']).columns
-        categorical_features = X.select_dtypes(include=['object']).columns
-
-        # Create preprocessing steps for numeric and categorical data
-        numeric_transformer = Pipeline(steps=[
-            ('imputer', SimpleImputer(strategy='median')),
-            ('scaler', StandardScaler())
+    # Combine preprocessing steps
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_transformer, numeric_features),
+            ('cat', categorical_transformer, categorical_features)
         ])
 
-        categorical_transformer = Pipeline(steps=[
-            ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-            ('onehot', OneHotEncoder(handle_unknown='ignore'))
-        ])
+    # Fit the preprocessor and transform the data
+    X_processed = preprocessor.fit_transform(X)
 
-        # Combine preprocessing steps
-        preprocessor = ColumnTransformer(
-            transformers=[
-                ('num', numeric_transformer, numeric_features),
-                ('cat', categorical_transformer, categorical_features)
-            ])
+    # Log transform the target variable
+    y = np.log1p(y)
+    logging.info("Applied log transformation to target variable")
 
-        # Fit the preprocessor and transform the data
-        X_processed = preprocessor.fit_transform(X)
-        
-        # Get feature names after preprocessing
-        onehot_encoder = preprocessor.named_transformers_['cat'].named_steps['onehot']
-        cat_feature_names = onehot_encoder.get_feature_names_out(categorical_features)
-        feature_names = list(numeric_features) + list(cat_feature_names)
+    # Get feature names after preprocessing
+    onehot_encoder = preprocessor.named_transformers_['cat'].named_steps['onehot']
+    cat_feature_names = onehot_encoder.get_feature_names_out(categorical_features)
+    feature_names = list(numeric_features) + list(cat_feature_names)
 
-    else:
-        # If data is not a DataFrame, we assume it's already preprocessed
-        X_processed = data
-        y = target_column  # In this case, target_column is actually y
-        preprocessor = None
-        feature_names = None
+    # Convert X_processed to DataFrame
+    X_processed = pd.DataFrame(X_processed, columns=feature_names, index=X.index)
 
-    logging.info(f"Total rows after preprocessing: {len(y)}")
+    logging.info(f"Total rows after preprocessing: {X_processed.shape[0]}")
+    logging.info(f"Number of features after preprocessing: {X_processed.shape[1]}")
     return X_processed, y, preprocessor, feature_names
 
 
@@ -254,13 +271,22 @@ def create_preprocessor(X_train, preprocessor_path):
 def create_range_based_models(X, y, model_class, param_grid):
     print("Creating range-based models...")
     # Define emission ranges
-    low_threshold = y.quantile(0.33)
-    high_threshold = y.quantile(0.67)
+    low_threshold = np.percentile(y, 33)
+    high_threshold = np.percentile(y, 67)
+
+    # Create masks for each range
+    low_mask = y <= low_threshold
+    medium_mask = (y > low_threshold) & (y <= high_threshold)
+    high_mask = y > high_threshold
 
     # Split data into ranges
-    X_low, y_low = X[y <= low_threshold], y[y <= low_threshold]
-    X_medium, y_medium = X[(y > low_threshold) & (y <= high_threshold)], y[(y > low_threshold) & (y <= high_threshold)]
-    X_high, y_high = X[y > high_threshold], y[y > high_threshold]
+    X_low = X[low_mask] if isinstance(X, pd.DataFrame) else X[low_mask]
+    X_medium = X[medium_mask] if isinstance(X, pd.DataFrame) else X[medium_mask]
+    X_high = X[high_mask] if isinstance(X, pd.DataFrame) else X[high_mask]
+    
+    y_low = y[low_mask]
+    y_medium = y[medium_mask]
+    y_high = y[high_mask]
 
     # Create and train models for each range
     models = {}
@@ -275,19 +301,22 @@ def create_range_based_models(X, y, model_class, param_grid):
 def predict_with_range_models(models, X, low_threshold, high_threshold):
     predictions = np.zeros(X.shape[0])
 
-    # Use the first feature (assuming it's 'Total reported direct emissions') to determine which model to use
-    if scipy.sparse.issparse(X):
-        emissions = X.tocsr()[:, 0].toarray().flatten()
-    else:
+    # Check if X is a DataFrame or a NumPy array
+    if isinstance(X, pd.DataFrame):
+        emissions = X.iloc[:, 0].values
+    else:  # Assume it's a NumPy array
         emissions = X[:, 0]
 
     for i in range(X.shape[0]):
         if emissions[i] <= low_threshold:
-            predictions[i] = models['low'].predict(X[i].reshape(1, -1))[0]
+            input_data = X.iloc[[i]] if isinstance(X, pd.DataFrame) else X[i:i+1]
+            predictions[i] = models['low'].predict(input_data)[0]
         elif emissions[i] <= high_threshold:
-            predictions[i] = models['medium'].predict(X[i].reshape(1, -1))[0]
+            input_data = X.iloc[[i]] if isinstance(X, pd.DataFrame) else X[i:i+1]
+            predictions[i] = models['medium'].predict(input_data)[0]
         else:
-            predictions[i] = models['high'].predict(X[i].reshape(1, -1))[0]
+            input_data = X.iloc[[i]] if isinstance(X, pd.DataFrame) else X[i:i+1]
+            predictions[i] = models['high'].predict(input_data)[0]
 
     return predictions
 
@@ -309,7 +338,7 @@ def create_and_evaluate_model(model, X_train, X_test, y_train, y_test, model_nam
     model.fit(X_train, y_train)
     
     # Cross-validation
-    cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring='r2')
+    cv_scores = cross_val_score(model, X_train, y_train, cv=10, scoring='r2')
     logging.info(f"{model_name} Cross-Validation Scores: {cv_scores}")
     logging.info(f"{model_name} Mean CV Score: {np.mean(cv_scores):.4f} (+/- {np.std(cv_scores) * 2:.4f})")
     
@@ -372,29 +401,75 @@ def create_and_evaluate_model(model, X_train, X_test, y_train, y_test, model_nam
     
     return model
 
+def handle_outliers(X, y, contamination=0.1):
+    iso_forest = IsolationForest(contamination=contamination, random_state=42)
+    outlier_mask = iso_forest.fit_predict(X) != -1
+    return outlier_mask
+
+def apply_transformations(X):
+    numeric_features = X.select_dtypes(include=['float64', 'int64']).columns
+    for feature in numeric_features:
+        X[f'{feature}_log'] = np.log1p(X[feature])
+        X[f'{feature}_squared'] = X[feature] ** 2
+    return X
+
+def create_ensemble(X_train, y_train):
+    rf = RandomForestRegressor(n_estimators=200, random_state=42)
+    gb = GradientBoostingRegressor(n_estimators=200, random_state=42)
+    ensemble = VotingRegressor([('rf', rf), ('gb', gb)])
+    ensemble.fit(X_train, y_train)
+    return ensemble
+
 def main():
     print("Starting main function...")
-    # Load the feature-engineered data
+    # Load the data
     data_path = os.path.join('..', 'data', 'feature_engineered_data.csv')
     df = load_data(data_path)
 
+    print("Available columns in the dataset:")
+    print(df.columns.tolist())
+
+    # Select features
+    selected_features, X = select_features(df)
+    print(f"Selected features: {selected_features}")
+
+    # Identify the target variable (CO2 emissions)
+    co2_columns = [col for col in df.columns if 'co2' in col.lower() or 'carbon dioxide' in col.lower()]
+    if not co2_columns:
+        raise ValueError("No CO2 emissions column found in the dataset")
+    target_column = co2_columns[0]  # Use the first matching column
+    print(f"Using '{target_column}' as the target variable")
+
+    y = df[target_column]
+
     # Preprocess the data
-    X, y, preprocessor, feature_names = preprocess_data(df, 'CO2 emissions (non-biogenic) ')
+    X_processed, y, preprocessor, feature_names = preprocess_data(X, y)
+
+    # Handle outliers
+    outlier_mask = handle_outliers(X_processed, y)
+    X_processed = X_processed[outlier_mask]
+    y = y[outlier_mask]
 
     # Split the data
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(X_processed, y, test_size=0.2, random_state=42)
+
+    # Engineer features for train and test sets separately
+    X_train_engineered = engineer_features(X_train, feature_names)
+    X_test_engineered = engineer_features(X_test, feature_names)
 
     # Hyperparameter tuning
     rf_params = {
-        'n_estimators': [100, 200],
-        'max_depth': [10, 20, None],
-        'min_samples_split': [2, 5, 10]
+        'n_estimators': [100, 200, 300],
+        'max_depth': [10, 20, 30, None],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4]
     }
 
     gb_params = {
-        'n_estimators': [100, 200],
+        'n_estimators': [100, 200, 300],
         'max_depth': [3, 5, 7],
-        'learning_rate': [0.01, 0.1, 0.2]
+        'learning_rate': [0.01, 0.1, 0.2],
+        'subsample': [0.8, 1.0]
     }
 
     # Create range-based models
@@ -425,6 +500,13 @@ def main():
     rf_model = create_and_evaluate_model(rf_model, X_train, X_test, y_train, y_test, "Random Forest", feature_names)
     gb_model = create_and_evaluate_model(gb_model, X_train, X_test, y_train, y_test, "Gradient Boosting", feature_names)
 
+    # Train and evaluate ensemble model
+    ensemble_model = create_ensemble(X_train, y_train)
+    ensemble_predictions = ensemble_model.predict(X_test)
+    logging.info("\nEnsemble Model Performance:")
+    logging.info(f"R2 Score: {r2_score(y_test, ensemble_predictions):.4f}")
+    logging.info(f"MAE: {mean_absolute_error(y_test, ensemble_predictions):.2f}")
+
     # Print best parameters
     logging.info(f"\nBest Random Forest Parameters: {rf_model.best_params_}")
     logging.info(f"Best Gradient Boosting Parameters: {gb_model.best_params_}")
@@ -443,6 +525,12 @@ def main():
     model_path = os.path.join('..', 'models', 'best_model.joblib')
     joblib.dump(best_model, model_path)
     logging.info(f"\nBest model ({best_model_name}) saved to {model_path}")
+
+    logging.info("Plotting feature importance for the best model")
+    plot_feature_importance(best_model.best_estimator_, feature_names)
+
+    logging.info("Generating learning curve for the best model")
+    plot_learning_curve(best_model.best_estimator_, X_processed, y)
 
     # Print final performance of the best model
     best_predictions = np.expm1(best_model.predict(X_test))

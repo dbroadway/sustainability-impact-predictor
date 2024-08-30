@@ -1,3 +1,7 @@
+import pandas as pd
+import numpy as np
+from sklearn.feature_selection import SelectKBest, f_regression
+
 def engineer_features(df):
     print("Engineering features...")
     
@@ -85,3 +89,39 @@ def engineer_features(df):
     df['log_total_emissions'] = np.log1p(df['total_ghg_emissions'])
     
     return df
+
+def select_and_refine_features(df, target_column, k=20):
+    print("Selecting and refining features...")
+    
+    # Exclude emission-related columns and the target column
+    exclude_keywords = ['emissions', 'CO2', 'reported direct', 'GHG']
+    feature_columns = [col for col in df.columns if not any(keyword.lower() in col.lower() for keyword in exclude_keywords) and col != target_column]
+    
+    X = df[feature_columns]
+    y = df[target_column]
+    
+    # Select K best features
+    selector = SelectKBest(score_func=f_regression, k=k)
+    X_new = selector.fit_transform(X, y)
+    
+    # Get selected feature names
+    selected_features = X.columns[selector.get_support()].tolist()
+    
+    # Create interaction terms for numeric features
+    X_selected = X[selected_features]
+    numeric_features = X_selected.select_dtypes(include=['float64', 'int64']).columns
+    for i in range(len(numeric_features)):
+        for j in range(i+1, len(numeric_features)):
+            feature_name = f'{numeric_features[i]}_{numeric_features[j]}_interaction'
+            X_selected[feature_name] = X_selected[numeric_features[i]] * X_selected[numeric_features[j]]
+            selected_features.append(feature_name)
+    
+    # Bin latitude and longitude if present
+    if 'latitude' in selected_features:
+        X_selected['latitude_bin'] = pd.qcut(X_selected['latitude'], q=10, labels=False)
+        selected_features.append('latitude_bin')
+    if 'longitude' in selected_features:
+        X_selected['longitude_bin'] = pd.qcut(X_selected['longitude'], q=10, labels=False)
+        selected_features.append('longitude_bin')
+    
+    return X_selected, selected_features
